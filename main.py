@@ -5,7 +5,9 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
+
 TIMEZONE = ZoneInfo("Asia/Yekaterinburg")
+
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
@@ -21,7 +23,6 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt
 with open(TOKEN_FILE, "r", encoding="utf-8") as f:
     BOT_TOKEN = f.read().strip()
 
-
 TIME_WINDOWS = [(6, 8), (17, 21)]
 SLOT_MINUTES = 30
 ALLOWED_WEEKDAYS = {1, 3, 5}  # Вт, Чт, Сб
@@ -31,7 +32,12 @@ WEEKDAY_NAMES = {
 }
 
 # ==================== ФАЙЛ ХРАНЕНИЯ ====================
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bookings.json")
+PERSISTENT_DIR = "/app/data"
+if not os.path.isdir(PERSISTENT_DIR):
+    PERSISTENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATA_FILE = os.path.join(PERSISTENT_DIR, "bookings.json")
+logging.info(f"Файл данных: {DATA_FILE}")
 
 bookings: dict[str, dict[str, int]] = {}
 users: dict[int, dict[str, str]] = {}
@@ -41,6 +47,47 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+# ==================== ХЕЛПЕРЫ ВРЕМЕНИ ====================
+def now_local() -> datetime:
+    return datetime.now(TIMEZONE)
+
+
+def today_local():
+    return now_local().date()
+
+
+def today_str() -> str:
+    return today_local().strftime("%Y-%m-%d")
+
+
+def tomorrow_str() -> str:
+    return (today_local() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def yesterday_str() -> str:
+    return (today_local() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def is_weekday_allowed(date_str: str) -> bool:
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return False
+    return d.weekday() in ALLOWED_WEEKDAYS
+
+
+def is_bookable_date(date_str: str) -> bool:
+    """Записаться можно: сегодня (Вт/Чт/Сб) или завтра (Вт/Чт/Сб)."""
+    if not is_weekday_allowed(date_str):
+        return False
+    return date_str in (today_str(), tomorrow_str())
+
+
+def is_visible_in_my(date_str: str) -> bool:
+    """В /my видим: вчера, сегодня, завтра."""
+    return date_str in (yesterday_str(), today_str(), tomorrow_str())
+
+
 # ==================== СОХРАНЕНИЕ / ЗАГРУЗКА ====================
 def save_data() -> None:
     try:
@@ -48,6 +95,7 @@ def save_data() -> None:
             "bookings": bookings,
             "users": {str(k): v for k, v in users.items()},
         }
+        os.makedirs(PERSISTENT_DIR, exist_ok=True)
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -62,18 +110,22 @@ def load_data() -> None:
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         loaded_bookings = data.get("bookings", {})
         bookings = {
             date: {t: int(uid) for t, uid in day.items()}
             for date, day in loaded_bookings.items()
         }
+
         loaded_users = data.get("users", {})
         users = {int(k): v for k, v in loaded_users.items()}
+
         old_usernames = data.get("usernames", {})
         for k, v in old_usernames.items():
             uid = int(k)
             if uid not in users:
                 users[uid] = {"name": v, "room": "—"}
+
         logging.info(
             f"Загружено: {sum(len(d) for d in bookings.values())} записей, "
             f"{len(users)} пользователей."
@@ -84,26 +136,16 @@ def load_data() -> None:
         users = {}
 
 
-# ==================== ХЕЛПЕРЫ ====================
-def now_local() -> datetime:
-    return datetime.now(TIMEZONE)
-
-
+# ==================== ХЕЛПЕРЫ ДАТ ====================
 def next_allowed_dates(count: int = 5) -> list[str]:
+    """Ближайшие N дат, попадающих на Вт/Чт/Сб, включая сегодня."""
     result = []
-    d = now_local().date()
+    d = today_local()
     while len(result) < count:
         if d.weekday() in ALLOWED_WEEKDAYS:
             result.append(d.strftime("%Y-%m-%d"))
         d += timedelta(days=1)
     return result
-
-
-def bookable_date() -> str | None:
-    tmr = now_local().date() + timedelta(days=1)
-    if tmr.weekday() in ALLOWED_WEEKDAYS:
-        return tmr.strftime("%Y-%m-%d")
-    return None
 
 
 def human_date(date_str: str) -> str:
@@ -128,6 +170,10 @@ def slot_start_dt(date_str: str, time_str: str) -> datetime:
     ).replace(tzinfo=TIMEZONE)
 
 
+def is_slot_started(date_str: str, time_str: str) -> bool:
+    return slot_start_dt(date_str, time_str) <= now_local()
+
+
 def is_slot_finished(date_str: str, time_str: str) -> bool:
     return slot_start_dt(date_str, time_str) + timedelta(minutes=SLOT_MINUTES) <= now_local()
 
@@ -141,6 +187,18 @@ def user_label(user_id: int) -> str:
 
 def is_registered(user_id: int) -> bool:
     return user_id in users and bool(users[user_id].get("room"))
+
+
+def get_user_actual_bookings(uid: int) -> list[tuple[str, str]]:
+    """Записи пользователя, видимые в /my: вчера, сегодня, завтра."""
+    result = []
+    for date_str in sorted(bookings.keys()):
+        if not is_visible_in_my(date_str):
+            continue
+        for t in sorted(bookings[date_str].keys()):
+            if bookings[date_str][t] == uid:
+                result.append((date_str, t))
+    return result
 
 
 # ==================== НИЖНЯЯ ПАНЕЛЬ ====================
@@ -163,11 +221,6 @@ def bottom_kb() -> ReplyKeyboardMarkup:
 
 
 def bottom_kb_hidden() -> ReplyKeyboardMarkup:
-    """
-    Панель для незарегистрированного.
-    По сути убирает все кнопки, оставляя пустую клавиатуру,
-    чтобы человек не мог нажимать не то.
-    """
     kb = ReplyKeyboardBuilder()
     return kb.as_markup(resize_keyboard=True, remove_keyboard=True)
 
@@ -184,14 +237,25 @@ def main_menu_kb() -> InlineKeyboardBuilder:
 
 
 def dates_kb() -> InlineKeyboardBuilder:
+    """
+    Показывает 5 ближайших Вт/Чт/Сб.
+    • 🟢 — сегодня или завтра (можно записаться).
+    • ⚪ — остальные (видно, но при нажатии — алерт «только за день/в день»).
+    """
     kb = InlineKeyboardBuilder()
-    bookable = bookable_date()
+    t = today_str()
+    tmr = tomorrow_str()
     for d in next_allowed_dates(5):
-        if d == bookable:
-            text = f"🟢 {human_date(d)} — открыта запись"
+        label = human_date(d)
+        if d == t:
+            label += " (сегодня)"
+            prefix = "🟢"
+        elif d == tmr:
+            label += " (завтра)"
+            prefix = "🟢"
         else:
-            text = f"⚪ {human_date(d)}"
-        kb.button(text=text, callback_data=f"date|{d}")
+            prefix = "⚪"
+        kb.button(text=f"{prefix} {label}", callback_data=f"date|{d}")
     kb.button(text="⬅️ В меню", callback_data="menu|main")
     kb.adjust(1)
     return kb
@@ -204,7 +268,7 @@ def slots_kb(date_str: str) -> InlineKeyboardBuilder:
         uid = day.get(slot)
         if uid:
             kb.button(text=f"🔴 {slot} — {user_label(uid)}", callback_data=f"noop|{date_str}|{slot}")
-        elif is_slot_finished(date_str, slot):
+        elif is_slot_started(date_str, slot):
             kb.button(text=f"⬛ {slot} — прошло", callback_data=f"noop|{date_str}|{slot}")
         else:
             kb.button(text=f"🟢 {slot} — свободно", callback_data=f"book|{date_str}|{slot}")
@@ -229,7 +293,10 @@ def help_text() -> str:
         "📅 Дни записи: <b>Вт, Чт, Сб</b>\n"
         "⏰ Слоты (ЕКБ): 06:00–08:00 и 17:00–21:00\n"
         "⌛ 30 минут на человека, 1 человек на слот.\n\n"
-        "❗ Запись открывается <b>только за день</b> до слота.\n\n"
+        "📌 Записаться можно:\n"
+        "• <b>в день слота</b> — если сегодня Вт/Чт/Сб и слот ещё не начался,\n"
+        "• <b>за день до слота</b> — если завтра Вт/Чт/Сб.\n\n"
+        "📌 Своя запись видна в «Мои записи» ещё <b>1 день</b> после слота.\n\n"
         "Кнопки снизу:\n"
         "🚿 Записаться — выбрать слот\n"
         "📋 Мои записи — список твоих броней\n"
@@ -246,7 +313,7 @@ def main_menu_text(uid: int) -> str:
         "📅 Дни: Вт, Чт, Сб\n"
         "⏰ Слоты: 06:00–08:00 и 17:00–21:00 (ЕКБ)\n"
         "⌛ 30 минут, 1 человек на слот.\n\n"
-        "<b>Запись открывается только за день до слота.</b>"
+        "<b>Запись: в день слота или за день до него.</b>"
     )
 
 
@@ -260,26 +327,31 @@ async def show_main_menu(message: Message) -> None:
 
 
 async def show_dates(message: Message) -> None:
-    bookable = bookable_date()
-    if bookable:
-        hint = f"\n\n✅ Сейчас открыта запись на <b>{human_date(bookable)}</b>."
-    else:
-        hint = "\n\n⛔ Сейчас запись закрыта. Открывается за день до слота (Вт/Чт/Сб)."
     await message.answer(
-        "Выбери дату:" + hint,
+        "Выбери дату:\n\n"
+        "🟢 — открыта запись (сегодня/завтра)\n"
+        "⚪ — запись откроется позже (за день до слота)",
         reply_markup=dates_kb().as_markup(),
-        parse_mode="HTML",
+    )
+
+
+def format_my_bookings(uid: int) -> str:
+    items = get_user_actual_bookings(uid)
+    if not items:
+        return "📋 Записей нет."
+    lines = []
+    for date_str, t in items:
+        status = "✅" if not is_slot_finished(date_str, t) else "🕓"
+        lines.append(f"{status} {human_date(date_str)} в {t}")
+    return (
+        "📋 <b>Твои записи:</b>\n"
+        + "\n".join(lines)
+        + "\n\n<i>Записи видны ещё 1 день после слота.</i>"
     )
 
 
 async def show_my(message: Message) -> None:
-    uid = message.from_user.id
-    lines = []
-    for date_str in sorted(bookings):
-        for t in sorted(bookings[date_str]):
-            if bookings[date_str][t] == uid:
-                lines.append(f"• {human_date(date_str)} в {t}")
-    text = "📋 <b>Твои записи:</b>\n" + "\n".join(lines) if lines else "📋 Записей нет."
+    text = format_my_bookings(message.from_user.id)
     kb = InlineKeyboardBuilder()
     kb.button(text="🚿 Записаться", callback_data="menu|book")
     kb.adjust(1)
@@ -288,16 +360,15 @@ async def show_my(message: Message) -> None:
 
 async def show_cancel(message: Message) -> None:
     uid = message.from_user.id
-    kb = InlineKeyboardBuilder()
-    found = False
-    for date_str in sorted(bookings):
-        for t in sorted(bookings[date_str]):
-            if bookings[date_str][t] == uid:
-                kb.button(text=f"{human_date(date_str)} {t}", callback_data=f"unbook|{date_str}|{t}")
-                found = True
-    if not found:
+    items = get_user_actual_bookings(uid)
+
+    if not items:
         await message.answer("❌ Нечего отменять.")
         return
+
+    kb = InlineKeyboardBuilder()
+    for date_str, t in items:
+        kb.button(text=f"{human_date(date_str)} {t}", callback_data=f"unbook|{date_str}|{t}")
     kb.adjust(1)
     await message.answer("Что отменить?", reply_markup=kb.as_markup())
 
@@ -315,16 +386,8 @@ async def show_profile(message: Message) -> None:
     )
 
 
-# ==================== МИДЛВАРЬ: СТРОГАЯ БЛОКИРОВКА ====================
+# ==================== МИДЛВАРЬ ====================
 class RegistrationGateMiddleware(BaseMiddleware):
-    """
-    Пока пользователь не зарегистрирован (нет номера комнаты):
-      • /start → пропускаем (обработчик снова попросит комнату)
-      • /help  → пропускаем
-      • любой текст (не команда) → пропускаем как ввод комнаты
-      • всё остальное → блокируем и просим комнату
-    """
-
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
@@ -338,35 +401,24 @@ class RegistrationGateMiddleware(BaseMiddleware):
         if is_registered(user.id):
             return await handler(event, data)
 
-        # --- незарегистрированный ---
         if isinstance(event, Message):
             text = (event.text or "").strip()
-
-            # Разрешаем /start и /help
             if text.startswith("/"):
                 cmd = text.split()[0].split("@")[0].lower()
                 if cmd in ("/start", "/help"):
                     return await handler(event, data)
-                # Любая другая команда — блокируем
                 await event.answer(
                     ask_room_message(),
                     reply_markup=bottom_kb_hidden(),
                     parse_mode="HTML",
                 )
                 return None
-
-            # Не команда и не пусто — это ввод комнаты, пропускаем
             return await handler(event, data)
 
-        # Любой callback — блокируем
         if isinstance(event, CallbackQuery):
-            await event.answer(
-                "⛔ Сначала напиши номер комнаты.",
-                show_alert=True,
-            )
+            await event.answer("⛔ Сначала напиши номер комнаты.", show_alert=True)
             return None
 
-        # Всё прочее блокируем
         return None
 
 
@@ -382,7 +434,6 @@ async def cmd_start(message: Message):
 
     if not is_registered(uid):
         save_data()
-        # Скрываем нижнюю панель, пока не зарегистрируется
         await message.answer(
             ask_room_message(),
             reply_markup=bottom_kb_hidden(),
@@ -404,16 +455,14 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    # /help доступен только зарегистрированным (до регистрации блокируется мидлварью)
     await message.answer(help_text(), reply_markup=bottom_kb(), parse_mode="HTML")
 
 
-# ==================== ВВОД КОМНАТЫ / КНОПКИ ПАНЕЛИ ====================
+# ==================== ВВОД КОМНАТЫ / КНОПКИ ====================
 @dp.message(F.text, ~F.text.startswith("/"))
 async def on_text(message: Message):
     uid = message.from_user.id
 
-    # Зарегистрирован → реагируем на кнопки нижней панели
     if is_registered(uid):
         text = (message.text or "").strip()
         if text == BTN_BOOK:
@@ -433,7 +482,6 @@ async def on_text(message: Message):
             )
         return
 
-    # Не зарегистрирован → это ввод комнаты
     room = (message.text or "").strip()
     if not room:
         await message.answer(
@@ -473,28 +521,18 @@ async def cb_menu_main(call: CallbackQuery):
 
 @dp.callback_query(F.data == "menu|book")
 async def cb_menu_book(call: CallbackQuery):
-    bookable = bookable_date()
-    if bookable:
-        hint = f"\n\n✅ Сейчас открыта запись на <b>{human_date(bookable)}</b>."
-    else:
-        hint = "\n\n⛔ Сейчас запись закрыта. Открывается за день до слота (Вт/Чт/Сб)."
     await call.message.edit_text(
-        "Выбери дату:" + hint,
+        "Выбери дату:\n\n"
+        "🟢 — открыта запись (сегодня/завтра)\n"
+        "⚪ — запись откроется позже (за день до слота)",
         reply_markup=dates_kb().as_markup(),
-        parse_mode="HTML",
     )
     await call.answer()
 
 
 @dp.callback_query(F.data == "menu|my")
 async def cb_menu_my(call: CallbackQuery):
-    uid = call.from_user.id
-    lines = []
-    for date_str in sorted(bookings):
-        for t in sorted(bookings[date_str]):
-            if bookings[date_str][t] == uid:
-                lines.append(f"• {human_date(date_str)} в {t}")
-    text = "📋 <b>Твои записи:</b>\n" + "\n".join(lines) if lines else "📋 Записей нет."
+    text = format_my_bookings(call.from_user.id)
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ В меню", callback_data="menu|main")
     await call.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -504,16 +542,15 @@ async def cb_menu_my(call: CallbackQuery):
 @dp.callback_query(F.data == "menu|cancel")
 async def cb_menu_cancel(call: CallbackQuery):
     uid = call.from_user.id
+    items = get_user_actual_bookings(uid)
+
     kb = InlineKeyboardBuilder()
-    found = False
-    for date_str in sorted(bookings):
-        for t in sorted(bookings[date_str]):
-            if bookings[date_str][t] == uid:
-                kb.button(text=f"{human_date(date_str)} {t}", callback_data=f"unbook|{date_str}|{t}")
-                found = True
+    for date_str, t in items:
+        kb.button(text=f"{human_date(date_str)} {t}", callback_data=f"unbook|{date_str}|{t}")
     kb.button(text="⬅️ В меню", callback_data="menu|main")
     kb.adjust(1)
-    if not found:
+
+    if not items:
         await call.message.edit_text("❌ Нечего отменять.", reply_markup=kb.as_markup())
     else:
         await call.message.edit_text("Что отменить?", reply_markup=kb.as_markup())
@@ -546,18 +583,14 @@ async def cb_change_room(call: CallbackQuery):
     await call.answer()
 
 
-# ==================== CALLBACK-И ДЛЯ СЛОТОВ ====================
+# ==================== CALLBACK-И СЛОТОВ ====================
 @dp.callback_query(F.data == "back")
 async def cb_back(call: CallbackQuery):
-    bookable = bookable_date()
-    if bookable:
-        hint = f"\n\n✅ Сейчас открыта запись на <b>{human_date(bookable)}</b>."
-    else:
-        hint = "\n\n⛔ Сейчас запись закрыта."
     await call.message.edit_text(
-        "Выбери дату:" + hint,
+        "Выбери дату:\n\n"
+        "🟢 — открыта запись (сегодня/завтра)\n"
+        "⚪ — запись откроется позже (за день до слота)",
         reply_markup=dates_kb().as_markup(),
-        parse_mode="HTML",
     )
     await call.answer()
 
@@ -565,16 +598,15 @@ async def cb_back(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("date|"))
 async def cb_date(call: CallbackQuery):
     date_str = call.data.split("|", 1)[1]
-    bookable = bookable_date()
-    if bookable is None:
-        await call.answer("⛔ Запись сейчас закрыта.", show_alert=True)
-        return
-    if date_str != bookable:
+
+    if not is_bookable_date(date_str):
         await call.answer(
-            f"⛔ Запись только за день. Сейчас можно на {human_date(bookable)}.",
+            "⛔ Запись на этот день ещё закрыта.\n"
+            "Откроется за день до слота или в день слота.",
             show_alert=True,
         )
         return
+
     await call.message.edit_text(
         f"📅 <b>{human_date(date_str)}</b>\nВыбери слот (время ЕКБ):",
         reply_markup=slots_kb(date_str).as_markup(),
@@ -588,21 +620,27 @@ async def cb_book(call: CallbackQuery):
     uid = call.from_user.id
     parts = call.data.split("|")
     date_str, time_str = parts[1], parts[2]
-    bookable = bookable_date()
-    if bookable is None or date_str != bookable:
-        await call.answer("⛔ Запись только за день до слота.", show_alert=True)
+
+    if not is_bookable_date(date_str):
+        await call.answer(
+            "⛔ Запись на этот день ещё закрыта. Только за день или в день слота.",
+            show_alert=True,
+        )
         return
+
     day = bookings.setdefault(date_str, {})
     if time_str in day and day[time_str] != uid:
         await call.answer("Слот уже занят!", show_alert=True)
         return
-    if is_slot_finished(date_str, time_str):
-        await call.answer("Слот уже прошёл.", show_alert=True)
+    if is_slot_started(date_str, time_str):
+        await call.answer("Слот уже начался.", show_alert=True)
         return
+
     for t, u in day.items():
         if u == uid and t != time_str:
-            await call.answer(f"У тебя уже есть запись на {t}.", show_alert=True)
+            await call.answer(f"У тебя уже есть запись на {t} в этот день.", show_alert=True)
             return
+
     day[time_str] = uid
     save_data()
     await call.answer(f"✅ Записан на {time_str}", show_alert=True)
