@@ -4,7 +4,8 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
-import pytz
+from zoneinfo import ZoneInfo
+TIMEZONE = ZoneInfo("Asia/Yekaterinburg")
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
@@ -19,7 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
 with open(TOKEN_FILE, "r", encoding="utf-8") as f:
     BOT_TOKEN = f.read().strip()
-TIMEZONE = pytz.timezone("Asia/Yekaterinburg")
+
 
 TIME_WINDOWS = [(6, 8), (17, 21)]
 SLOT_MINUTES = 30
@@ -122,9 +123,9 @@ def generate_slots() -> list[str]:
 
 
 def slot_start_dt(date_str: str, time_str: str) -> datetime:
-    return TIMEZONE.localize(
-        datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    )
+    return datetime.strptime(
+        f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+    ).replace(tzinfo=TIMEZONE)
 
 
 def is_slot_finished(date_str: str, time_str: str) -> bool:
